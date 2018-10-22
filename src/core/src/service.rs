@@ -19,9 +19,14 @@ use sawtooth_sdk::consensus::{engine::*,service::Service};
 use std::thread::sleep;
 use std::time;
 use std::time::Instant;
-
-use rand;
-use rand::Rng;
+use poet2_util;
+use std::collections::HashMap;
+use serde_json;
+use enclave_sgx as enclave;
+use enclave_sgx::*;
+use sgxffi::ffi::r_sgx_enclave_id_t;
+use sgxffi::ffi::r_sgx_signup_info_t;       
+use sgxffi::ffi::r_sgx_wait_certificate_t;
 
 const DEFAULT_WAIT_TIME: u64 = 0;
 
@@ -29,30 +34,32 @@ pub struct Poet2Service {
     service: Box<Service>,
     init_wall_clock: Instant,
     chain_clock: u64,
+    pub enclave: EnclaveConfig,
 }
 
 impl Poet2Service {
-       pub fn new(service_: Box<Service>) -> Self {
+    pub fn new(service_: Box<Service>) -> Self {
         let now = Instant::now();
         Poet2Service { 
-        	service : service_, 
-        	init_wall_clock : now,
-        	chain_clock : 0,
+            service : service_,
+            init_wall_clock : now,
+            chain_clock : 0,
+            enclave : EnclaveConfig::default(),
         }
     }
-	
-	pub fn get_chain_clock(&mut self) -> u64 {
-		self.chain_clock
-	}
-	
-	pub fn get_wall_clock(&mut self) -> u64 {
-		self.init_wall_clock.elapsed().as_secs()
-	}
-	
-	pub fn set_chain_clock(&mut self, new_cc : u64) {
-		self.chain_clock = new_cc;
-	}
-	
+
+    pub fn get_chain_clock(&mut self) -> u64 {
+        self.chain_clock
+    }
+
+    pub fn get_wall_clock(&mut self) -> u64 {
+        self.init_wall_clock.elapsed().as_secs()
+    }
+
+    pub fn set_chain_clock(&mut self, new_cc : u64) {
+        self.chain_clock = new_cc;
+    }
+
     pub fn get_chain_head(&mut self) -> Block {
         debug!("Getting chain head");
         self.service
@@ -60,13 +67,20 @@ impl Poet2Service {
             .expect("Failed to get chain head")
     }
 
-    pub fn get_block(&mut self, block_id: BlockId) -> Block {
+    pub fn get_block(&mut self, block_id: BlockId) -> Result<Block, Error> {
         debug!("Getting block {:?}", block_id);
-        self.service
-            .get_blocks(vec![block_id.clone()])
-            .expect("Failed to get block")
-            .remove(&block_id) //remove from the returned hashmap to get value 
-            .unwrap()
+        let blocks = self.service
+            .get_blocks(vec![block_id.clone()]);
+        match blocks {
+            Err(err) => {
+                warn!("Could not get a block with id {:?}", block_id.clone());
+                Err(Error::UnknownBlock(format!("Block not found for id {:?}", block_id.clone())))
+            }
+            Ok(mut block_map) => {
+                //remove from the returned hashmap to get value
+                Ok(block_map.remove(&block_id).unwrap())
+            }
+        }
     }
 
     pub fn initialize_block(&mut self, previous_id: Option<BlockId>) {
@@ -76,23 +90,25 @@ impl Poet2Service {
             .expect("Failed to initialize block");
     }
 
-    pub fn finalize_block(&mut self) -> BlockId {
-        debug!("Finalizing block");
+    pub fn summarize_block(&mut self) -> Vec<u8> {
+        debug!("Summarizing block");
         let mut summary = self.service.summarize_block();
         while let Err(Error::BlockNotReady) = summary {
-            warn!("Block not ready to summarize");
-            sleep(time::Duration::from_secs(1));
-            summary = self.service.summarize_block();
+           debug!("Block not ready to summarize");
+           sleep(time::Duration::from_secs(1));
+           summary = self.service.summarize_block();
         }
+        summary.expect("Failed to summarize block")
+    }
 
-        let consensus: Vec<u8> = create_consensus(&summary.expect("Failed to summarize block"));
+    pub fn finalize_block(&mut self, consensus: Vec<u8>) -> BlockId {
+        debug!("Finalizing block");
         let mut block_id = self.service.finalize_block(consensus.clone());
         while let Err(Error::BlockNotReady) = block_id {
             warn!("Block not ready to finalize");
             sleep(time::Duration::from_secs(1));
             block_id = self.service.finalize_block(consensus.clone());
         }
-
         block_id.expect("Failed to finalize block")
     }
 
@@ -124,8 +140,10 @@ impl Poet2Service {
             .expect("Failed to commit block");
     }
 
+
     pub fn cancel_block(&mut self) {
         debug!("Cancelling block");
+        //TODO Handle InvalidState better
         match self.service.cancel_block() {
             Ok(_) => {}
             Err(Error::InvalidState(_)) => {}
@@ -135,10 +153,10 @@ impl Poet2Service {
         };
     }
 
-    pub fn broadcast(&mut self, block_id: BlockId) {
-        debug!("Broadcasting published block: {:?}", block_id);
+    pub fn broadcast(&mut self, payload: Vec<u8>) {
+        debug!("Broadcasting payload");
         self.service
-            .broadcast("published", Vec::from(block_id))
+            .broadcast("published", payload)
             .expect("Failed to broadcast published block");
     }
 
@@ -160,54 +178,144 @@ impl Poet2Service {
             .expect("Failed to send block ack");
     }
 
-    // Calculate the time to wait between publishing blocks. This will be a
-    // random number between the settings sawtooth.consensus.min_wait_time and
-    // sawtooth.consensus.max_wait_time if max > min, else DEFAULT_WAIT_TIME. If
-    // there is an error parsing those settings, the time will be
-    // DEFAULT_WAIT_TIME.
-    pub fn calculate_wait_time(&mut self, chain_head_id: BlockId) -> time::Duration {
+    pub fn get_wait_time(&mut self, pre_chain_head: Block, validator_id: &Vec<u8>,
+                        poet_pub_key: &String) -> u64
+    {
+        let mut duration64: u64 = 0_u64;
+        let mut prev_wait_certificate = String::new();
+        let mut prev_wait_certificate_sig = String::new();
+
+        debug!("Getting new wait time for next block.");
+        if pre_chain_head.block_num != 0_u64 { // non-genesis block
+            let result =
+                 poet2_util::payload_to_wc_and_sig(pre_chain_head.payload.clone());
+            prev_wait_certificate = result.0;
+            prev_wait_certificate_sig = result.1;
+        }
+        duration64 = EnclaveConfig::initialize_wait_certificate(
+                              self.enclave.enclave_id,
+                              prev_wait_certificate,
+                              prev_wait_certificate_sig,
+                              &validator_id,
+                              &poet_pub_key);
+
+        let minimum_duration : f64 = 1.0_f64;
+        let local_mean = 5.5_f64;
+        let tagd = (duration64 as f64) / (u64::max_value() as f64);
+        let mut wait_time = minimum_duration
+                            - local_mean * tagd.log10();
+        if wait_time as u64 == 0_u64 {
+             wait_time = minimum_duration; 
+        }
+        return wait_time as u64;
+    }
+
+    pub fn get_settings(&mut self, block_id: BlockId, keys: Vec<String>)
+         -> Result<HashMap<String, String>, Error> {
         let settings_result = self.service.get_settings(
-            chain_head_id,
+            block_id,
+            keys);
+        settings_result
+    }
+
+    pub fn get_setting(&mut self, block_id: BlockId, key:String) -> String {
+        let settings_result = self.service.get_settings(
+            block_id,
             vec![
-                String::from("sawtooth.consensus.min_wait_time"),
-                String::from("sawtooth.consensus.max_wait_time"),
-            ],
+                    key.clone(),
+                ],
         );
 
-        let wait_time = if let Ok(settings) = settings_result {
-            let ints: Vec<u64> = vec![
-                settings.get("sawtooth.consensus.min_wait_time").unwrap(),
-                settings.get("sawtooth.consensus.max_wait_time").unwrap(),
-            ].iter()
-                .map(|string| string.parse::<u64>())
-                .map(|result| result.unwrap_or(0))
-                .collect();
+        if settings_result.is_ok() {
+            settings_result.unwrap().remove(&key).unwrap()
+        }
+        else {
+            error!("Could not get setting for key {}", key);
+            String::from("")
+        }
+    }
 
-            let min_wait_time: u64 = ints[0];
-            let max_wait_time: u64 = ints[1];
+    pub fn get_setting_from_head(&mut self, key:String) ->  String {
+        let head_id:BlockId = self.get_chain_head().block_id;
+        self.get_setting( head_id, key )
+    }
 
-            debug!("Min: {:?} -- Max: {:?}", min_wait_time, max_wait_time);
+    pub fn create_consensus(&mut self, summary: Vec<u8>, chain_head: Block, wait_time : u64) -> String {
+        let mut wait_certificate = String::new();
+        let mut wait_certificate_sig = String::new();
 
-            if min_wait_time >= max_wait_time {
-                DEFAULT_WAIT_TIME
-            } else {
-                rand::thread_rng().gen_range(min_wait_time, max_wait_time)
+        if chain_head.block_num != 0_u64 { // not genesis block
+            let result =
+                 poet2_util::payload_to_wc_and_sig(chain_head.payload.clone());
+            wait_certificate = result.0;
+            wait_certificate_sig = result.1;
+        }
+        info!("Block id returned is {:?}", Vec::from(chain_head.block_id.clone()));
+        let (serial_cert, cert_signature) = EnclaveConfig::finalize_wait_certificate(
+                self.enclave.enclave_id,
+                wait_certificate,
+                poet2_util::blockid_to_hex_string(chain_head.block_id),
+                wait_certificate_sig, 
+                poet2_util::to_hex_string(summary),
+                wait_time
+            );
+
+        let mut payload_to_send = serial_cert;
+        payload_to_send.push_str("#");
+        payload_to_send.push_str(&cert_signature); 
+        return payload_to_send.clone();
+    }
+
+    pub fn verify_wait_certificate( &mut self, _block: &Block, previous_block: &Block, poet_pub_key: &String) -> bool {
+        let mut block = _block.clone();
+        let mut wait_cert_verify_status:bool = false;
+
+        
+        let (wait_cert, wait_cert_sign) = get_wait_cert_and_signature(&block);
+        debug!("Serialized wait_cert : {:?}", &wait_cert);
+        let deser_wait_cert:WaitCertificate = serde_json::from_str(&wait_cert).unwrap();
+
+        let sig_verify_status = EnclaveConfig::verify_wait_certificate(self.enclave.enclave_id,
+                                                            &poet_pub_key,
+                                                            &wait_cert, &wait_cert_sign);
+
+        debug!("sig_verify_status={:?}", sig_verify_status);
+
+        let prev_id = poet2_util::blockid_to_hex_string(block.previous_id);
+        let block_id = poet2_util::blockid_to_hex_string(block.block_id);
+        let signer_id =poet2_util::to_hex_string(block.signer_id.to_vec());
+        let summary = poet2_util::to_hex_string(block.summary);
+        
+        if( (deser_wait_cert.prev_block_id == prev_id) &&
+            (deser_wait_cert.block_number == block.block_num) &&
+            (deser_wait_cert.block_summary == summary) &&
+            (deser_wait_cert.validator_id == signer_id) &&
+            sig_verify_status) {
+            
+            if( block.block_num > 1){
+                let mut prev_block = previous_block.clone();
+                let (prev_wait_cert, prev_wait_cert_sig) = get_wait_cert_and_signature(&prev_block);
+                if(deser_wait_cert.prev_wait_cert_sig == prev_wait_cert_sig){
+                    wait_cert_verify_status = true;
+                }
             }
-        } else {
-            DEFAULT_WAIT_TIME
-        };
+            else if(block.block_num == 1) {
+                wait_cert_verify_status = true;
+            }
+        }
 
-        info!("Wait time: {:?}", wait_time);
-
-        time::Duration::from_secs(wait_time)
+        debug!("wait_cert_verify_status = {:?}", wait_cert_verify_status);
+        wait_cert_verify_status
     }
 }
 
-fn create_consensus(summary: &[u8]) -> Vec<u8> {
-    let mut consensus: Vec<u8> = Vec::from(&b"Devmode"[..]);
-    consensus.extend_from_slice(summary);
-    consensus
-}
+pub fn get_wait_cert_and_signature(block: &Block) -> (String, String) {
+        let mut payload = block.payload.clone();
+        debug!("Extracted payload from block: {:?}", payload.clone());
+        let (wait_cert, wait_cert_sign) = poet2_util::payload_to_wc_and_sig(payload);
+
+        (wait_cert, wait_cert_sign)
+    }
 
 
 #[cfg(test)]
@@ -216,17 +324,17 @@ mod tests {
     use std::default::Default;
     use zmq;
     use sawtooth_sdk::consensus::{zmq_service::ZmqService};
-	use protobuf::{Message as ProtobufMessage};
-	use protobuf;
-	use sawtooth_sdk::messages::consensus::*;
-	use sawtooth_sdk::messages::validator::{Message, Message_MessageType};
-	use sawtooth_sdk::messaging::zmq_stream::ZmqMessageConnection;
-	use sawtooth_sdk::messaging::stream::MessageConnection;
-	fn generate_correlation_id() -> String {
-	    const LENGTH: usize = 16;
-	    rand::thread_rng().gen_ascii_chars().take(LENGTH).collect()
-	}
-	fn send_req_rep<I: protobuf::Message, O: protobuf::Message>(
+    use protobuf::{Message as ProtobufMessage};
+    use protobuf;
+    use sawtooth_sdk::messages::consensus::*;
+    use sawtooth_sdk::messages::validator::{Message, Message_MessageType};
+    use sawtooth_sdk::messaging::zmq_stream::ZmqMessageConnection;
+    use sawtooth_sdk::messaging::stream::MessageConnection;
+    fn generate_correlation_id() -> String {
+        const LENGTH: usize = 16;
+        rand::thread_rng().gen_ascii_chars().take(LENGTH).collect()
+    }
+    fn send_req_rep<I: protobuf::Message, O: protobuf::Message>(
         connection_id: &[u8],
         socket: &zmq::Socket,
         request: I,
@@ -273,7 +381,7 @@ mod tests {
         (connection_id, request)
     }
 
-	macro_rules! service_test {
+    macro_rules! service_test {
         (
             $socket:expr,
             $rep:expr,
@@ -312,20 +420,8 @@ mod tests {
             let mut svc = Poet2Service::new( Box::new(zmq_svc) );
             
             svc.initialize_block(Some(Default::default()));
-            /*svc.finalize_block();
-            svc.cancel_block();
-			svc.get_block(Default::default());
-            svc.get_chain_head();
-            svc.check_block(Default::default());
-            svc.commit_block(Default::default());
-            svc.ignore_block(Default::default());
-            svc.fail_block(Default::default());
-			svc.broadcast(Default::default());
-			assert_eq!(2, 2);
-            */
-			//assert_eq!(2, 3);
-		});
-		service_test!(
+        });
+        service_test!(
             &socket,
             ConsensusInitializeBlockResponse::new(),
             ConsensusInitializeBlockResponse_Status::OK,
@@ -337,6 +433,6 @@ mod tests {
     
     #[test]
     fn test_dummy() {
-    	assert_eq!(4, 2+2);
+        assert_eq!(4, 2+2);
     }
 }

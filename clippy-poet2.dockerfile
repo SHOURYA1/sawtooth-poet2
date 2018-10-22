@@ -1,4 +1,4 @@
-# Copyright 2017 Intel Corporation
+# Copyright 2018 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,6 +60,12 @@ RUN curl https://sh.rustup.rs -sSf > /usr/bin/rustup-init \
 ENV PATH=$PATH:/protoc3/bin:/project/sawtooth-core/bin:/root/.cargo/bin \
     CARGO_INCREMENTAL=0
 
-RUN rustup component add rustfmt-preview
+RUN rustup install nightly-2018-08-18
 
-WORKDIR /project/sawtooth-poet2
+RUN rustup component add clippy-preview --toolchain=nightly-2018-08-18
+
+RUN rustup default nightly-2018-08-18
+
+RUN rustup show
+
+WORKDIR /

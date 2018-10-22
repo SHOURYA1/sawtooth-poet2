@@ -1,4 +1,4 @@
-# Copyright 2017 Intel Corporation
+# Copyright 2018 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,22 +14,29 @@
 # ------------------------------------------------------------------------------
 
 FROM ubuntu:xenial
-
 RUN echo "deb [arch=amd64] http://repo.sawtooth.me/ubuntu/ci xenial universe" >> /etc/apt/sources.list \
  && (apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 8AA7AF1F1091A5FD \
  || apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 8AA7AF1F1091A5FD) \
  && apt-get update \
  && apt-get install -y -q --allow-downgrades \
-    build-essential \
-    curl \
-    libssl-dev \
-    gcc \
-    libzmq3-dev \
-    openssl \
-    pkg-config \
-    python3-grpcio-tools=1.1.3-1 \
-    unzip \
-    git \
+ build-essential \
+ curl \
+ gcc \
+ cmake \
+ clang \
+ libclang-dev \
+ openssl \
+ libssl-dev \
+ libc6-dev \
+ libcrypto++-dev \
+ libjson-c-dev \
+ libzmq3-dev \
+ make \
+ wget \
+ pkg-config \
+ python3-grpcio-tools=1.1.3-1 \
+ unzip \
+ git \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
@@ -62,4 +69,10 @@ ENV PATH=$PATH:/protoc3/bin:/project/sawtooth-core/bin:/root/.cargo/bin \
 
 RUN rustup component add rustfmt-preview
 
-WORKDIR /project/sawtooth-poet2
+WORKDIR /tmp
+
+RUN bash -c "wget https://download.01.org/intel-sgx/linux-2.3/ubuntu16.04-server/sgx_linux_x64_sdk_2.3.100.46354.bin \
+  && chmod +x sgx_linux_x64_sdk_2.3.100.46354.bin  \
+  && echo \"yes\" | ./sgx_linux_x64_sdk_2.3.100.46354.bin \
+  && chmod +x ./sgxsdk/environment"
+

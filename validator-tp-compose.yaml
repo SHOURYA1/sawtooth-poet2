@@ -27,11 +27,11 @@ services:
         - https_proxy
         - no_proxy
     volumes:
-      - ./:/project/sawtooth-poet2/
-    working_dir: '/project/sawtooth-poet2/src/core'
-    entrypoint: "bash -c \"rm -rf /project/sawtooth-poet2/src/core/bin &&\
+      - ./src/validator-registry-tp:/project/validator-registry-tp/
+    working_dir: '/project/validator-registry-tp'
+    entrypoint: "bash -c \"rm -rf /project/validator-registry-tp/bin &&\
 	mkdir -p ./bin/ &&\
-	cd /project/sawtooth-poet2/src/core &&\ 
-	cargo build --release && cp ./target/release/poet2 ./bin/poet2 &&\
-	cargo run --bin poet2 -- -C tcp://localhost:5005 && tail -f /dev/null \""
+	cd /project/validator-registry-tp &&\ 
+	cargo build --release && cp ./target/release/validator_registry_tp ./bin/validator_registry_tp &&\
+	cargo run --bin validator_registry_tp -- -C tcp://localhost:4004 && tail -f /dev/null \""
     stop_signal: SIGKILL

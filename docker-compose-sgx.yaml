@@ -1,4 +1,4 @@
-# Copyright 2017 Intel Corporation
+# Copyright 2018 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +13,14 @@
 # limitations under the License.
 # ------------------------------------------------------------------------------
 
-version: "2.1"
+version: "3.6"
 
 services:
 
   poet2-engine:
     container_name: poet2-engine
     build:
-      context: ./
+      context: .
       dockerfile: ./poet2-engine.dockerfile
       args:
         - http_proxy
@@ -30,8 +30,23 @@ services:
       - ./:/project/sawtooth-poet2/
     working_dir: '/project/sawtooth-poet2/src/core'
     entrypoint: "bash -c \"rm -rf /project/sawtooth-poet2/src/core/bin &&\
-	mkdir -p ./bin/ &&\
-	cd /project/sawtooth-poet2/src/core &&\ 
-	cargo build --release && cp ./target/release/poet2 ./bin/poet2 &&\
-	cargo run --bin poet2 -- -C tcp://localhost:5005 && tail -f /dev/null \""
+        mkdir -p ./bin/ &&\
+        cd /project/sawtooth-poet2/src/core &&\
+        cargo build --release && cp ./target/release/poet2 ./bin/poet2 &&\
+        cargo run --bin poet2 -- -C tcp://localhost:5005 \""
     stop_signal: SIGKILL
+
+ 
+  sgx-enclave:
+    container_name: sgx-enclave
+    build:
+      context: .
+      dockerfile: ./poet2-sgx-engine.dockerfile
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
+    volumes:
+      - ./:/project/sawtooth-poet2/
+    stop_signal: SIGKILL
+
